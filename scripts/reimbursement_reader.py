@@ -110,6 +110,27 @@ class FileInfo:
     metadata: dict[str, Any]
 
 
+@dataclass
+class TravelAllowanceConfig:
+    enabled: bool
+    region: str
+    meal_deduction_mode: str
+    travel_dates: set[str] | None
+
+
+TRAVEL_ALLOWANCE_REGIONS = {
+    "south-china": ("华南区内（含香港、澳门）", 120.0),
+    "outside-south-china": ("华南区外", 200.0),
+}
+
+MEAL_DEDUCTIONS = {
+    "lunch": ("午餐", 60.0),
+    "dinner": ("晚餐", 80.0),
+    "none": ("不扣餐", 0.0),
+    "flag": ("暂按晚餐", 80.0),
+}
+
+
 def normalize_header(value: Any, index: int) -> str:
     text = str(value or "").strip()
     if not text:
@@ -390,6 +411,21 @@ def date_patterns(value: Any, year: str) -> list[str]:
     ]
 
 
+def parse_travel_dates(value: str, year: str) -> set[str] | None:
+    if not value.strip():
+        return None
+    dates: set[str] = set()
+    for part in re.split(r"[,，;；\s]+", value.strip()):
+        if not part:
+            continue
+        normalized = normalize_date(part, year)
+        if re.match(r"^20\d{2}-\d{2}-\d{2}$", normalized):
+            dates.add(normalized)
+        else:
+            raise ValueError(f"无法识别差旅日期: {part}")
+    return dates
+
+
 def merchant_from_filename(file_info: FileInfo) -> str:
     stem = Path(file_info.path).stem
     match = re.match(r"^\d{6}_\d+(?:\.\d{1,2})?_(.+)$", stem)
@@ -504,6 +540,88 @@ def make_oa_rows(month_rows: list[dict[str, Any]], files: list[FileInfo], year: 
                 ]
             )
     return oa_rows, unresolved
+
+
+def build_travel_allowance_rows(
+    month_rows: list[dict[str, Any]],
+    year: str,
+    config: TravelAllowanceConfig | None,
+) -> tuple[list[list[Any]], list[list[Any]]]:
+    if not config or not config.enabled:
+        return [], []
+
+    region_label, base_amount = TRAVEL_ALLOWANCE_REGIONS[config.region]
+    deduction_label, deduction_amount = MEAL_DEDUCTIONS[config.meal_deduction_mode]
+    grouped: dict[str, dict[str, Any]] = defaultdict(lambda: {"customers": set(), "meal": 0.0, "sources": []})
+
+    for row in month_rows:
+        date = normalize_date(row.get("日期"), year)
+        if not re.match(r"^20\d{2}-\d{2}-\d{2}$", date):
+            continue
+        if config.travel_dates is not None and date not in config.travel_dates:
+            continue
+        grouped[date]["customers"].add(text_value(row.get("客户")) or "客户/事项待补")
+        grouped[date]["sources"].append(f"{row['source_sheet']} 行{row['source_row']}")
+        meal_amount = number_value(row.get("餐饮费_value") or row.get("餐饮费")) or 0.0
+        grouped[date]["meal"] += meal_amount
+
+    oa_rows: list[list[Any]] = []
+    calc_rows: list[list[Any]] = []
+    for date in sorted(grouped):
+        item = grouped[date]
+        meal_amount = round(float(item["meal"]), 2)
+        actual_deduction = deduction_amount if meal_amount > 0 else 0.0
+        allowance = round(max(base_amount - actual_deduction, 0.0), 2)
+        customers = "；".join(sorted(customer for customer in item["customers"] if customer))
+        missing: list[str] = []
+        if config.travel_dates is None:
+            missing.append("请确认该日为广州外出差且满8小时以上")
+        if meal_amount > 0 and config.meal_deduction_mode == "flag":
+            missing.append("请确认当天餐费对应午餐还是晚餐；当前暂按晚餐扣80")
+        status = "待补材料/确认" if missing else "可录入草稿"
+        if meal_amount > 0:
+            deduction_text = f"当天有餐费{meal_amount:.2f}，{deduction_label}扣{actual_deduction:.2f}"
+        else:
+            deduction_text = "当天无已报销餐费，扣0"
+        description = (
+            f"{region_label}出差满8小时以上；基础餐补{base_amount:.2f}；"
+            f"{deduction_text}；餐补{allowance:.2f}。"
+        )
+        oa_rows.append(
+            [
+                status,
+                "餐补规则自动计算",
+                date,
+                customers,
+                "差旅餐饮补贴",
+                "业务差旅餐补",
+                "",
+                "",
+                "",
+                allowance,
+                description,
+                "",
+                "出差起止时间、出差地和已报销餐扣除说明",
+                "",
+                "；".join(missing),
+                "当天产生餐费需扣除对应餐补；午餐扣60，晚餐扣80。",
+            ]
+        )
+        calc_rows.append(
+            [
+                date,
+                customers,
+                region_label,
+                "待确认" if config.travel_dates is None else "是",
+                base_amount,
+                meal_amount,
+                deduction_text,
+                allowance,
+                status,
+                "；".join(item["sources"]),
+            ]
+        )
+    return oa_rows, calc_rows
 
 
 def has_matching_transport_row(oa_rows: list[list[Any]], date: str, amount: float, detail_type: str) -> bool:
@@ -635,6 +753,7 @@ def add_rules(ws) -> None:
         ["私车公用-油费", "交通费；按日期/客户行程填写公里数和金额", "高德历史导航截图；成品油发票", "1km = 1.4元；油票金额需覆盖报销额", "无两地信息/无公里数/油票不足/日期不接近", "销售自驾出差通常需拜访两个或以上客户。"],
         ["过路费", "交通费；私车公用相关费用", "ETC电子票据汇总单；通行费电子发票", "按实际发生日期填写", "无汇总单；日期与行程不一致", "不同日期路桥费分开填写。"],
         ["打车软件", "交通费；打车软件", "行程单；电子发票", "通常 Max RMB 50/程，特殊情况写说明", "只有发票无行程单；起终点不清", "金额为“？”的先不要录入。"],
+        ["差旅餐饮补贴", "出差外地满8小时以上；按区域和当天已报销餐扣除后填写", "出差起止时间、出差地、已报销餐扣除说明", "华南区内120/day；华南区外200/day；午餐扣60；晚餐扣80", "未扣已报销餐费；午/晚餐口径不清；未说明满8小时", "脚本传 --auto-travel-allowance 后生成餐补核算表。"],
         ["交际应酬费-餐费", "交际应酬费；注明客户公司、人员、午/晚餐", "餐饮发票；必要时付款记录", "午餐 Max RMB 80/人；晚餐 Max RMB 200/人", "缺客户名单/业务背景；后开票无付款记录", "客户来访或无拜访记录时要写发生背景。"],
         ["住宿费", "住宿费；填写入住/退房日期、天数、地点", "酒店水单+发票；无水单则订单截图/批准", "AL5及others通常 Max RMB 400/day；AL4 Manager Max RMB 700/day", "无水单；超标无原因；日期不一致", "超额原因写在 OA 对应字段。"],
         ["停车费", "交通费；停车费单独列", "停车票/电子发票；必要时付款记录", "按实际发生", "混入油费；缺地点/日期", "与对应拜访日期放在同一报销批次。"],
@@ -642,7 +761,13 @@ def add_rules(ws) -> None:
     write_table(ws, 4, rows, [18, 28, 30, 25, 35, 28])
 
 
-def build_workbook(root: Path, ledger_path: Path, month: str, output: Path) -> dict[str, Any]:
+def build_workbook(
+    root: Path,
+    ledger_path: Path,
+    month: str,
+    output: Path,
+    allowance_config: TravelAllowanceConfig | None = None,
+) -> dict[str, Any]:
     year = month[:4]
     rows = read_ledger(ledger_path)
     all_files = collect_files(root)
@@ -650,6 +775,8 @@ def build_workbook(root: Path, ledger_path: Path, month: str, output: Path) -> d
     month_rows = [row for row in rows if row_month(row, year) == month]
     oa_rows, unresolved = make_oa_rows(month_rows, files, year)
     add_orphan_transport_rows(oa_rows, files)
+    allowance_rows, allowance_calc_rows = build_travel_allowance_rows(month_rows, year, allowance_config)
+    oa_rows.extend(allowance_rows)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -703,6 +830,26 @@ def build_workbook(root: Path, ledger_path: Path, month: str, output: Path) -> d
     ]
     write_table(ws, 4, [source_headers] + source_rows, [12, 12, 22, 12, 12, 12, 12, 12, 12, 10, 14, 10, 12, 24], "DDEBF7")
 
+    if allowance_config and allowance_config.enabled:
+        ws = wb.create_sheet("餐补核算")
+        add_title(
+            ws,
+            f"{month} 差旅餐补核算",
+            "广州外出差满8小时以上；华南区内120/day（含港澳），华南区外200/day；当天已报销午餐扣60、晚餐扣80。",
+            10,
+        )
+        allowance_headers = ["日期", "客户/事项", "区域口径", "满8小时", "基础餐补", "当天餐费", "扣除口径", "餐补金额", "状态", "来源"]
+        write_table(
+            ws,
+            4,
+            [allowance_headers] + allowance_calc_rows,
+            [12, 24, 18, 12, 12, 12, 34, 12, 18, 24],
+            "DDEBF7",
+        )
+        for row_idx in range(5, 5 + len(allowance_calc_rows)):
+            for col_idx in (5, 6, 8):
+                ws.cell(row_idx, col_idx).number_format = "¥#,##0.00"
+
     ws = wb.create_sheet("发票索引")
     add_title(ws, f"{month} 发票索引", "按月份、文件名和PDF可读信息生成；继续归档发票后可重新运行更新。", 9)
     file_headers = ["路径", "识别类型", "发票日期", "金额", "销售方/商户", "购买方", "发票号", "大小KB", "备注"]
@@ -740,6 +887,8 @@ def build_workbook(root: Path, ledger_path: Path, month: str, output: Path) -> d
         "oa_rows": len(oa_rows),
         "files": len(files),
         "gaps": len(gap_rows),
+        "allowance_rows": len(allowance_rows),
+        "allowance_total": round(sum(float(row[9] or 0) for row in allowance_rows), 2),
         "total": round(sum(float(row[9] or 0) for row in oa_rows), 2),
     }
 
@@ -756,13 +905,37 @@ def main() -> None:
     parser.add_argument("--month", required=True, help="Target month in YYYYMM, e.g. 202605.")
     parser.add_argument("--ledger", default=None, help="Ledger workbook path. Defaults to <root>/<year>/报销清单.xlsx.")
     parser.add_argument("--output", default=None, help="Output workbook path.")
+    parser.add_argument("--auto-travel-allowance", action="store_true", help="Add travel meal allowance rows for eligible outside-Guangzhou business trips.")
+    parser.add_argument(
+        "--travel-region",
+        choices=sorted(TRAVEL_ALLOWANCE_REGIONS),
+        default="outside-south-china",
+        help="Allowance region when --auto-travel-allowance is used.",
+    )
+    parser.add_argument(
+        "--meal-deduction-mode",
+        choices=sorted(MEAL_DEDUCTIONS),
+        default="flag",
+        help="How to deduct same-day reimbursed meals: lunch=60, dinner=80, none=0, flag=temporarily deduct dinner and mark confirmation.",
+    )
+    parser.add_argument(
+        "--travel-dates",
+        default="",
+        help="Comma-separated eligible travel dates such as 6.2,6.3 or 2026-06-02,2026-06-03. If omitted, all month rows are marked for confirmation.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args()
 
     root = Path(args.root).expanduser().resolve()
     ledger = Path(args.ledger).expanduser().resolve() if args.ledger else root / args.month[:4] / "报销清单.xlsx"
     output = Path(args.output).expanduser().resolve() if args.output else default_output(root, args.month)
-    result = build_workbook(root, ledger, args.month, output)
+    allowance_config = TravelAllowanceConfig(
+        enabled=args.auto_travel_allowance,
+        region=args.travel_region,
+        meal_deduction_mode=args.meal_deduction_mode,
+        travel_dates=parse_travel_dates(args.travel_dates, args.month[:4]),
+    )
+    result = build_workbook(root, ledger, args.month, output, allowance_config)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

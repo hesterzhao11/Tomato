@@ -17,6 +17,7 @@ description: Read, classify, and reconcile Chinese sales reimbursement materials
    - `发票索引`
    - `查漏清单`
    - `规则速查`
+   - `餐补核算` when travel meal allowance is requested or eligible travel dates are known
 5. Before finalizing, verify the workbook opens, row counts and totals are plausible, and no obvious formula errors or blank core sheets exist.
 
 ## Image Mileage Handling
@@ -46,6 +47,14 @@ The script writes:
 ```
 
 If the user has not finished month-based filing yet, still run the script: it also pulls candidate files whose file name or PDF invoice date matches the target month.
+
+When the user confirms outside-Guangzhou travel over 8 hours and wants travel meal allowance rows, use:
+
+```bash
+python scripts/reimbursement_reader.py --root /Users/hehe/Documents/报销 --month 202606 --auto-travel-allowance --travel-region outside-south-china --travel-dates 6.2,6.3,6.4
+```
+
+Use `--travel-region south-china` for South China trips including Hong Kong/Macau. Use `--meal-deduction-mode lunch` or `dinner` when the same-day reimbursed meal type is known; keep the default `flag` when it needs user confirmation.
 
 ## OA Entry Boundary
 
