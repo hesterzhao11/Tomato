@@ -1,0 +1,4 @@
+interface:
+  display_name: "报销读取"
+  short_description: "读取报销材料并生成月度OA清单"
+  default_prompt: "Use $reimbursement-reader to read monthly reimbursement files and generate an OA checklist."
